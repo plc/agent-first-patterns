@@ -44,33 +44,7 @@ CalDave is used as the reference implementation throughout this document. All co
 
 ### CalDave example
 
-CalDave exposes `GET /man` (short for "manual") that returns a complete JSON description of every endpoint. The endpoint catalog is pre-computed at module load time for performance:
-
-```javascript
-// src/routes/man.js
-const CACHED_ENDPOINTS = getEndpoints();
-
-function getEndpoints() {
-  return [
-    {
-      topic: 'agents',
-      method: 'POST',
-      path: '/agents',
-      description: 'Create a new agent identity. Returns agent_id and api_key (shown once — save it)...',
-      auth: 'none (optional X-Human-Key header)',
-      parameters: [
-        { name: 'name', in: 'body', required: false, type: 'string', description: 'Display name for the agent (max 255 chars)' },
-        { name: 'description', in: 'body', required: false, type: 'string', description: 'What this agent does (max 1024 chars)' }
-      ],
-      example_body: { name: 'My Agent', description: 'Manages team meetings' },
-      example_response: { agent_id: 'agt_x7y8z9AbCd', api_key: 'sk_live_...' }
-    },
-    // ... 24+ more endpoints
-  ]
-}
-```
-
-Each endpoint entry includes method, path, description, auth requirement, complete parameter list, and example request/response. An agent calling `GET /man` receives everything it needs to start using the API.
+CalDave exposes `GET /man` (short for "manual") that returns a complete JSON description of every endpoint. The endpoint catalog is pre-computed at module load time in src/routes/man.js for performance. Each endpoint entry includes method, path, description, auth requirement, complete parameter list, and example request/response. An agent calling `GET /man` receives everything it needs to start using the API.
 
 ```bash
 # Unauthenticated -- discover the full API
@@ -102,84 +76,18 @@ The response includes:
 
 ### CalDave example
 
-CalDave's `GET /man` endpoint includes a `buildRecommendation()` function that analyzes the agent's current state and returns the next logical action:
+CalDave's `GET /man` response includes a `recommended_next_step` field. The server inspects the agent's current state in src/routes/man.js -- whether it's authenticated, whether it has a name, calendars, events, and whether it's claimed by a human -- and returns the single most important next action. Each recommendation includes an action description, the endpoint to call, and a ready-to-execute curl command with the agent's real credentials.
 
-```javascript
-// src/routes/man.js (lines 508-580)
-function buildRecommendation(context, apiKey) {
-  if (!context.authenticated) {
-    return {
-      action: 'Create an agent',
-      description: 'You are not authenticated. Create an agent to get an API key.',
-      endpoint: 'POST /agents',
-      curl: buildCurl('POST', '/agents', {
-        body: { name: 'My Calendar Agent', description: 'Manages my schedule' }
-      })
-    };
-  }
+The recommendation chain progresses through these steps:
 
-  if (!context.agent_name) {
-    return {
-      action: 'Name your agent',
-      description: 'Your agent has no name. Setting a name helps identify your agent in calendar invites and logs.',
-      endpoint: 'PATCH /agents',
-      curl: buildCurl('PATCH', '/agents', { apiKey, body: { name: 'My Calendar Agent' } })
-    };
-  }
+1. Not authenticated -> "Create an agent" (POST /agents)
+2. No name -> "Name your agent" (PATCH /agents)
+3. No calendars -> "Create your first calendar" (POST /calendars)
+4. No events -> "Create your first event" (POST /calendars/:id/events)
+5. Not claimed -> "Claim this agent with a human account" (POST /agents/claim)
+6. Everything set up -> "Check upcoming events" (GET /calendars/:id/upcoming)
 
-  if (context.calendars.length === 0) {
-    return {
-      action: 'Create your first calendar',
-      description: 'You have no calendars yet. Create one to start managing events.',
-      endpoint: 'POST /calendars',
-      curl: buildCurl('POST', '/calendars', {
-        apiKey,
-        body: { name: 'Work Calendar', timezone: 'America/New_York' }
-      })
-    };
-  }
-
-  const totalEvents = context.calendars.reduce((sum, c) => sum + c.event_count, 0);
-  if (totalEvents <= context.calendars.length) {
-    // Each calendar gets a welcome event, so <= calendars.length means no user-created events
-    const cal = context.calendars[0];
-    return {
-      action: 'Create your first event',
-      description: 'You have calendars but no events yet.',
-      endpoint: 'POST /calendars/:id/events',
-      curl: buildCurl('POST', `/calendars/${cal.id}/events`, {
-        apiKey,
-        calId: cal.id,
-        body: {
-          title: 'Team standup',
-          start: '2026-04-10T10:00:00Z',
-          end: '2026-04-10T10:30:00Z'
-        }
-      })
-    };
-  }
-
-  if (!context.claimed) {
-    return {
-      action: 'Claim this agent with a human account',
-      description: 'Associate this agent with your human account for easier management.',
-      endpoint: 'POST /agents/claim',
-      curl: 'First create a human account at https://caldave.ai/signup, then use POST /agents/claim'
-    };
-  }
-
-  // Default recommendation when everything is set up
-  const cal = context.calendars[0];
-  return {
-    action: 'Check upcoming events',
-    description: 'See what\'s on your calendar.',
-    endpoint: 'GET /calendars/:id/upcoming',
-    curl: buildCurl('GET', `/calendars/${cal.id}/upcoming`, { apiKey, calId: cal.id })
-  };
-}
-```
-
-The recommendation chain progresses: not authenticated → no name → no calendars → no events → not claimed → check upcoming. Each step provides an executable curl command with the agent's real credentials interpolated.
+Each step provides an executable curl command with the agent's real credentials interpolated.
 
 ---
 
@@ -191,54 +99,9 @@ The recommendation chain progresses: not authenticated → no name → no calend
 
 ### CalDave example
 
-CalDave implements soft auth for discovery endpoints (`/man`, `/changelog`):
+CalDave implements soft auth for discovery endpoints (`/man`, `/changelog`) in src/routes/man.js. The middleware checks for an Authorization header, and if present and valid, populates `req.agent` with the agent's data. If the header is missing or invalid, `req.agent` is set to null and the request continues without authentication. Database errors also don't block the request -- they just result in null agent context.
 
-```javascript
-// src/routes/man.js (lines 24-47)
-async function softAuth(req, res, next) {
-  const header = req.headers.authorization;
-  if (!header || !header.startsWith('Bearer ')) {
-    req.agent = null;
-    return next();   // No 401 -- just proceed without agent context
-  }
-  const token = header.slice(7);
-  const hash = hashKey(token);
-  try {
-    const result = await pool.query(
-      'SELECT id, name, description FROM agents WHERE api_key_hash = $1',
-      [hash]
-    );
-    if (result.rows.length > 0) {
-      const row = result.rows[0];
-      req.agent = { id: row.id, name: row.name, description: row.description };
-    } else {
-      req.agent = null;
-    }
-  } catch {
-    req.agent = null;  // DB errors don't block the request
-  }
-  next();
-}
-
-// Usage:
-router.get('/man', softAuth, async (req, res) => {
-  // req.agent will be populated if auth succeeded, null otherwise
-  // Either way, the request proceeds
-});
-```
-
-Compare with hard auth used on resource endpoints:
-
-```javascript
-// src/middleware/auth.js
-async function auth(req, res, next) {
-  const header = req.headers.authorization;
-  if (!header || !header.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Missing or invalid Authorization header' });
-  }
-  // ... validate and set req.agent, return 401 if invalid
-}
-```
+Compare with hard auth used on resource endpoints in src/middleware/auth.js, which returns 401 if the Authorization header is missing or invalid.
 
 CalDave uses three auth styles:
 
@@ -259,42 +122,7 @@ CalDave uses three auth styles:
 
 ### CalDave example
 
-CalDave's `POST /agents` endpoint requires no authentication:
-
-```javascript
-// src/routes/agents.js (lines 41-100)
-router.post('/', optionalHumanKeyAuth, async (req, res) => {
-  try {
-    const id = agentId();           // agt_x7y8z9AbCd
-    const key = apiKey();           // sk_live_... (32 random chars)
-    const hash = hashKey(key);      // SHA-256 hash (only hash is stored)
-
-    const body = req.body || {};
-    const name = body.name || null;
-    const description = body.description || null;
-
-    // Validate optional fields (omitted for brevity)
-
-    await pool.query(
-      'INSERT INTO agents (id, api_key_hash, name, description) VALUES ($1, $2, $3, $4)',
-      [id, hash, name, description]
-    );
-
-    const response = {
-      agent_id: id,
-      api_key: key,
-      message: 'Store these credentials securely. The API key will not be shown again.',
-    };
-    if (name) response.name = name;
-    if (description) response.description = description;
-
-    res.status(201).json(response);
-  } catch (err) {
-    logError(err, { route: 'POST /agents', method: 'POST' });
-    res.status(500).json({ error: 'Failed to create agent' });
-  }
-});
-```
+CalDave's `POST /agents` endpoint requires no authentication. The implementation in src/routes/agents.js generates a unique agent ID (agt_ prefix), creates a random API key (sk_live_ prefix), hashes it with SHA-256, and stores only the hash in the database. The endpoint validates optional name and description fields, inserts the agent record, and returns the agent_id and api_key in the response with a warning that the key will only be shown once.
 
 An agent can bootstrap in seconds:
 
@@ -336,27 +164,7 @@ Key details:
 
 ### CalDave example
 
-CalDave supports topic filtering on `GET /man`:
-
-```javascript
-// src/routes/man.js (lines 689-703)
-if (topicFilter) {
-  const validTopics = ['agents', 'calendars', 'events', 'feeds', 'smtp', 'errors'];
-  const topics = topicFilter.split(',').map(t => t.trim());
-  const invalid = topics.filter(t => !validTopics.includes(t));
-  if (invalid.length > 0) {
-    return res.status(400).json({
-      error: `Unknown topic: ${invalid.join(', ')}. Available: ${validTopics.join(', ')}`
-    });
-  }
-
-  // Filter endpoints by topic, but always include discovery endpoints (agents, man, changelog)
-  const discoveryPaths = ['/agents', '/man', '/changelog'];
-  endpoints = endpoints.filter(ep =>
-    topics.includes(ep.topic) || discoveryPaths.includes(ep.path)
-  );
-}
-```
+CalDave supports topic filtering on `GET /man` in src/routes/man.js. The server validates the requested topics against a whitelist (agents, calendars, events, feeds, smtp, errors), filters the endpoint list to only include matching topics plus discovery endpoints (which are always included), and returns helpful errors if invalid topics are requested.
 
 Usage:
 
@@ -377,26 +185,7 @@ curl -s "https://caldave.ai/man?topic=bogus"
 # => { "error": "Unknown topic: bogus. Available: agents, calendars, events, feeds, smtp, errors" }
 ```
 
-Guide mode returns only context and recommendation:
-
-```javascript
-// src/routes/man.js (lines 658-686)
-if (req.query.guide !== undefined) {
-  return res.json({
-    overview: '...',
-    base_url: BASE,
-    rate_limits: { /* ... */ },
-    error_format: { /* ... */ },
-    your_context: context,
-    recommended_next_step: buildRecommendation(context, maskedKey),
-    discover_more: {
-      full_api_reference: 'GET /man (without ?guide) returns all endpoints.',
-      topic_filtering: 'GET /man?topic=events returns only event-related endpoints.',
-      changelog: 'GET /changelog shows new features since you signed up.'
-    }
-  });
-}
-```
+Guide mode returns only context and recommendation. When the `?guide` query parameter is present, the response includes overview, base_url, rate_limits, error_format, your_context, recommended_next_step, and a discover_more object with links to the full API reference and other resources. The endpoint catalog is completely omitted, significantly reducing token usage.
 
 ```bash
 # Guide mode -- much smaller response
@@ -414,38 +203,7 @@ curl -s "https://caldave.ai/man?guide" -H "Authorization: Bearer sk_live_..."
 
 ### CalDave example
 
-CalDave's `buildCurl()` function generates curl commands with real credentials:
-
-```javascript
-// src/routes/man.js (lines 53-79)
-function buildCurl(method, path, { apiKey, calId, evtId, body, queryString } = {}) {
-  let resolved = path
-    .replace(':id', calId || 'CAL_ID')
-    .replace(':event_id', evtId || 'EVT_ID')
-    .replace(':calendar_id', calId || 'CAL_ID');
-
-  let url = `${BASE}${resolved}`;
-  if (queryString) url += queryString;
-
-  const parts = [];
-  if (method === 'GET') {
-    parts.push(`curl -s "${url}"`);
-  } else {
-    parts.push(`curl -s -X ${method} "${url}"`);
-  }
-
-  if (apiKey) {
-    parts.push(`-H "Authorization: Bearer ${apiKey}"`);
-  }
-
-  if (body) {
-    parts.push('-H "Content-Type: application/json"');
-    parts.push(`-d '${JSON.stringify(body)}'`);
-  }
-
-  return parts.join(' \\\n  ');
-}
-```
+CalDave's `buildCurl()` function in src/routes/man.js generates curl commands with real credentials. The function takes a method, path, and optional parameters (apiKey, calId, evtId, body, queryString), resolves path parameters by replacing placeholders like :id with actual resource IDs, and constructs a properly formatted curl command with Authorization headers and JSON body when needed. If no credentials are provided, it falls back to placeholder values.
 
 When unauthenticated, examples use placeholders:
 
@@ -477,67 +235,7 @@ The agent can copy any curl command from the `/man` response and execute it imme
 
 ### CalDave example
 
-CalDave's `GET /changelog` endpoint uses soft auth to provide personalized change tracking:
-
-```javascript
-// src/routes/changelog.js (lines 26-49)
-async function softAuth(req, res, next) {
-  // ... (same soft auth implementation as /man)
-  // Fetches agent row including created_at timestamp
-}
-
-router.get('/', softAuth, async (req, res) => {
-  const CHANGELOG = [
-    {
-      date: '2026-03-31',
-      changes: [
-        {
-          type: 'feature',
-          title: 'Time-based webhooks for event.starting and event.ending',
-          description: 'Webhooks now fire 5 minutes before an event starts and when it ends...',
-          endpoints: ['POST /calendars (webhook_url field)'],
-          docs: BASE + '/docs#webhooks'
-        }
-      ]
-    },
-    // ... more entries
-  ];
-
-  if (req.agent) {
-    // Split changelog by agent's created_at date
-    const agentCreated = new Date(req.agent.created_at);
-    const changesSinceSignup = CHANGELOG.filter(entry => {
-      const entryDate = new Date(entry.date);
-      return entryDate >= agentCreated;
-    });
-
-    const recommendations = await buildRecommendations(req.agent);
-
-    return res.json({
-      description: 'API changelog. Lists new features, improvements, and fixes.',
-      poll_recommendation: 'Check this endpoint approximately once per week.',
-      total_changes: CHANGELOG.length,
-      your_agent: {
-        agent_id: req.agent.id,
-        name: req.agent.name,
-        created_at: req.agent.created_at
-      },
-      changes_since_signup: changesSinceSignup,
-      changes_since_signup_count: changesSinceSignup.length,
-      changelog: CHANGELOG,
-      recommendations
-    });
-  }
-
-  // Unauthenticated response
-  return res.json({
-    description: 'API changelog. Lists new features, improvements, and fixes.',
-    poll_recommendation: 'Check this endpoint approximately once per week.',
-    tip: 'Pass your API key as a Bearer token to see which changes are new since your agent was created.',
-    changelog: CHANGELOG
-  });
-});
-```
+CalDave's `GET /changelog` endpoint uses soft auth in src/routes/changelog.js to provide personalized change tracking. The endpoint maintains a structured CHANGELOG array with entries that include date, type (feature, improvement, fix, breaking), title, description, affected endpoints, and documentation links. When authenticated, it fetches the agent's created_at timestamp, filters the changelog to find entries newer than that date, builds personalized recommendations based on the agent's current setup, and returns both the full changelog and the filtered "changes since signup" list.
 
 Authenticated response shows what's new:
 
@@ -595,29 +293,7 @@ Each changelog entry has a `type` field (`feature`, `improvement`, `fix`, `break
 
 ### CalDave example
 
-CalDave defines known field sets for every resource and validates on every write:
-
-```javascript
-// src/routes/events.js (lines 180-183)
-const KNOWN_EVENT_FIELDS = new Set([
-  'title', 'description', 'start', 'end', 'location', 'status',
-  'all_day', 'recurrence', 'rrule', 'attendees', 'metadata'
-]);
-
-// Validation helper (lines 248-253)
-function checkUnknownFields(body) {
-  const unknown = Object.keys(body).filter(k => !KNOWN_EVENT_FIELDS.has(k));
-  if (unknown.length === 0) return null;
-  return `Unknown field${unknown.length > 1 ? 's' : ''}: ${unknown.join(', ')}`;
-}
-
-// Applied on every write endpoint
-router.post('/:id/events', auth, async (req, res) => {
-  const unknownErr = checkUnknownFields(req.body);
-  if (unknownErr) return res.status(400).json({ error: unknownErr });
-  // ... create event
-});
-```
+CalDave defines a Set of known fields for every resource type (events, calendars, agents) in their respective route files. On every write endpoint, incoming fields are checked against this set in a checkUnknownFields() helper function before processing. Unknown fields trigger a 400 error listing exactly which fields were unrecognized. This is applied consistently across all write endpoints in the API. The pattern appears in src/routes/events.js, src/routes/agents.js, and src/routes/calendars.js.
 
 Example of the error an agent receives:
 
@@ -638,19 +314,7 @@ Response (400):
 
 The agent immediately knows `start_time` and `end_time` aren't valid. It can check `/man` to find the correct field names (`start` and `end`).
 
-CalDave applies this pattern consistently:
-
-```javascript
-// src/routes/agents.js (lines 30-33)
-const ALLOWED_CREATE_FIELDS = new Set(['name', 'description']);
-const ALLOWED_PATCH_FIELDS = new Set(['name', 'description']);
-
-// src/routes/calendars.js (lines 57-67)
-const KNOWN_CALENDAR_POST_FIELDS = new Set(['name', 'timezone', 'agentmail_api_key', 'welcome_event', 'webhook_url', 'webhook_secret']);
-const KNOWN_CALENDAR_PATCH_FIELDS = new Set(['name', 'timezone', 'webhook_url', 'webhook_secret', 'agentmail_api_key']);
-```
-
-Every write endpoint uses `checkUnknownFields()` before processing the request.
+CalDave applies this pattern consistently across all resource types with separate Sets for create vs patch operations where needed.
 
 ---
 
@@ -662,29 +326,7 @@ Every write endpoint uses `checkUnknownFields()` before processing the request.
 
 ### CalDave example
 
-CalDave uses nanoid with type prefixes for all IDs:
-
-```javascript
-// src/lib/ids.js (complete file)
-const { customAlphabet } = require('nanoid');
-
-const alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
-const shortId = customAlphabet(alphabet, 12);   // 12 chars for entities
-const longId = customAlphabet(alphabet, 32);    // 32 chars for secrets
-
-const agentId = () => `agt_${shortId()}`;           // agt_x7y8z9AbCdEf
-const calendarId = () => `cal_${shortId()}`;        // cal_a1b2c3XyZwVu
-const eventId = () => `evt_${shortId()}`;           // evt_p4q5r6StUvWx
-const feedToken = () => `feed_${longId()}`;         // feed_abc123... (32 chars)
-const inboundToken = () => `inb_${longId()}`;       // inb_def456... (32 chars)
-const apiKey = () => `sk_live_${longId()}`;         // sk_live_... (32 chars)
-const humanId = () => `hum_${shortId()}`;           // hum_m7n8o9PqRsTu
-const humanAgentId = () => `ha_${shortId()}`;       // ha_y1z2a3BcDeFg
-const sessionToken = () => `sess_${longId()}`;      // sess_ghi789... (32 chars)
-const humanApiKey = () => `hk_live_${longId()}`;    // hk_live_... (32 chars)
-
-module.exports = { agentId, calendarId, eventId, feedToken, inboundToken, apiKey, humanId, humanAgentId, sessionToken, humanApiKey };
-```
+CalDave uses nanoid with type prefixes for all IDs. The implementation in src/lib/ids.js creates ID generators using customAlphabet with a base-62 alphanumeric character set. Short IDs (12 chars) are used for entities like agents, calendars, and events that appear in URLs. Long IDs (32 chars) are used for secrets, tokens, and API keys that need high entropy. Each generator function adds a descriptive prefix: agt_ for agents, cal_ for calendars, evt_ for events, feed_ for feed tokens, inb_ for inbound tokens, sk_live_ for agent API keys, hum_ for humans, ha_ for human-agent associations, sess_ for sessions, and hk_live_ for human API keys.
 
 Design decisions:
 - **Short IDs** (12 random chars) for entities that appear in URLs and logs
@@ -729,71 +371,18 @@ The agent (or human debugging) can see `evt_` in the URL and realize the mistake
 
 ### CalDave example
 
-Every error in CalDave uses `{ "error": "..." }`:
+Every error in CalDave uses `{ "error": "..." }` format across all routes:
 
-```javascript
-// 400 - Validation errors
-{ "error": "name is required" }
-{ "error": "Unknown fields: start_time, end_time" }
-{ "error": "title must be a string" }
-{ "error": "description exceeds 64KB limit" }
+- 400 - Validation errors like "name is required", "Unknown fields: start_time, end_time", "title must be a string", "description exceeds 64KB limit"
+- 401 - Auth errors like "Missing or invalid Authorization header"
+- 404 - Not found errors like "Calendar not found", "Event not found"
+- 404 - Global catch-all: "Not found. Try GET /man for the API reference."
+- 429 - Rate limit: "Too many requests, please try again later"
+- 500 - Server errors like "Failed to create event", "Failed to send invite"
 
-// 401 - Auth errors
-{ "error": "Missing or invalid Authorization header" }
+The error format is documented in the ERROR_FORMAT constant in src/routes/man.js so agents know what to expect. The format documentation includes the shape, a description explaining all errors use this consistent format, and a mapping of status codes to their meanings with guidance on how to handle each one.
 
-// 404 - Not found
-{ "error": "Calendar not found" }
-{ "error": "Event not found" }
-
-// 404 - Global catch-all
-{ "error": "Not found. Try GET /man for the API reference." }
-
-// 429 - Rate limit
-{ "error": "Too many requests, please try again later" }
-
-// 500 - Server errors
-{ "error": "Failed to create event" }
-{ "error": "Failed to send invite" }
-```
-
-The error format is documented in `GET /man` so agents know what to expect:
-
-```javascript
-// src/routes/man.js (lines 640-653)
-const ERROR_FORMAT = {
-  shape: '{ "error": "Human-readable message" }',
-  description: 'All errors use this consistent format. The error field always contains a single string describing what went wrong.',
-  status_codes: {
-    '200': 'Success',
-    '201': 'Created',
-    '204': 'No content (successful delete)',
-    '400': 'Validation error -- check the error message for details',
-    '401': 'Missing or invalid API key',
-    '404': 'Resource not found -- check the calendar_id or event_id',
-    '429': 'Rate limited -- check RateLimit-Reset header for retry time',
-    '500': 'Server error -- retry or check GET /errors for details'
-  }
-};
-```
-
-Agent code to handle any CalDave error:
-
-```javascript
-const response = await fetch('https://caldave.ai/calendars', {
-  method: 'POST',
-  headers: {
-    'Authorization': `Bearer ${apiKey}`,
-    'Content-Type': 'application/json'
-  },
-  body: JSON.stringify({ name: 'Work' })
-});
-
-const data = await response.json();
-if (data.error) {
-  console.log('CalDave API error:', data.error);
-  // Single consistent error handling path for all errors
-}
-```
+Agent code to handle any CalDave error requires only a single check for the `error` field, providing one consistent error handling path for all errors across the entire API.
 
 ---
 
@@ -805,14 +394,7 @@ if (data.error) {
 
 ### CalDave example
 
-CalDave's global 404 handler provides discovery guidance:
-
-```javascript
-// src/index.js (lines 280-282)
-app.use((req, res) => {
-  res.status(404).json({ error: 'Not found. Try GET /man for the API reference.' });
-});
-```
+CalDave's global 404 handler in src/index.js provides discovery guidance in the error message, directing agents to GET /man to discover valid endpoints.
 
 Every wrong URL becomes a learning opportunity:
 
@@ -836,70 +418,9 @@ The agent can immediately call `GET /man` to discover the correct endpoints. Thi
 
 ### CalDave example
 
-CalDave logs errors to the `error_log` table:
+CalDave logs errors to the `error_log` table using a logError() helper function in src/lib/errors.js. The function extracts the error message and stack trace, then inserts a record with route, method, status code, message, stack, and agent_id. This is called from every catch block throughout the codebase.
 
-```javascript
-// src/lib/errors.js (complete file)
-async function logError(err, ctx = {}) {
-  const message = err instanceof Error ? err.message : String(err);
-  const stack = err instanceof Error ? err.stack : null;
-
-  await pool.query(
-    `INSERT INTO error_log (route, method, status_code, message, stack, agent_id)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [ctx.route || null, ctx.method || null, ctx.status_code || 500, message, stack || null, ctx.agent_id || null]
-  );
-}
-```
-
-Called from every catch block:
-
-```javascript
-// src/routes/events.js
-router.post('/:id/events', auth, async (req, res) => {
-  try {
-    // ... create event
-  } catch (err) {
-    logError(err, { route: 'POST /calendars/:id/events', method: 'POST', agent_id: req.agent?.id });
-    res.status(500).json({ error: 'Failed to create event' });
-  }
-});
-```
-
-Agents can debug their own errors:
-
-```javascript
-// src/index.js (lines 226-274)
-app.get('/errors', auth, async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit) || 50, 100);
-  const routeFilter = req.query.route;
-
-  let query = 'SELECT id, route, method, status_code, message, created_at FROM error_log WHERE agent_id = $1';
-  const params = [req.agent.id];
-
-  if (routeFilter) {
-    query += ' AND route ILIKE $2';
-    params.push(`%${routeFilter}%`);
-  }
-
-  query += ' ORDER BY created_at DESC LIMIT $' + (params.length + 1);
-  params.push(limit);
-
-  const { rows } = await pool.query(query, params);
-  res.json({ errors: rows, count: rows.length });
-});
-
-app.get('/errors/:id', auth, async (req, res) => {
-  const { rows } = await pool.query(
-    'SELECT * FROM error_log WHERE id = $1 AND agent_id = $2',
-    [req.params.id, req.agent.id]
-  );
-  if (rows.length === 0) {
-    return res.status(404).json({ error: 'Error not found' });
-  }
-  res.json(rows[0]);
-});
-```
+Agents can debug their own errors through two endpoints defined in src/index.js. `GET /errors` accepts optional limit and route query parameters, queries the error_log table filtered by the authenticated agent's ID, and returns a list of recent errors with pagination. `GET /errors/:id` retrieves the full details of a specific error including stack trace, also filtered by agent_id for security.
 
 Usage:
 
@@ -944,44 +465,7 @@ Errors are scoped by agent_id -- an agent can only see errors from its own API c
 
 ### CalDave example
 
-CalDave returns ISO 8601 duration hints on time-sensitive endpoints:
-
-```javascript
-// src/routes/events.js (lines 57-69)
-function msToIsoDuration(ms) {
-  if (ms <= 0) return 'PT0S';
-  const totalSeconds = Math.floor(ms / 1000);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-
-  let parts = 'PT';
-  if (hours > 0) parts += `${hours}H`;
-  if (minutes > 0) parts += `${minutes}M`;
-  if (seconds > 0 || parts === 'PT') parts += `${seconds}S`;
-  return parts;
-}
-
-// src/routes/events.js (lines 458-490)
-router.get('/:id/upcoming', auth, async (req, res) => {
-  // ... fetch upcoming events
-  const events = rows.map(formatEvent);
-
-  const response = { events };
-
-  // Add polling hint
-  if (events.length > 0) {
-    const nextStart = new Date(events[0].start);
-    const now = new Date();
-    const msUntilNext = nextStart - now;
-    if (msUntilNext > 0) {
-      response.next_event_starts_in = msToIsoDuration(msUntilNext);
-    }
-  }
-
-  res.json(response);
-});
-```
+CalDave returns ISO 8601 duration hints on time-sensitive endpoints. In src/routes/events.js, the msToIsoDuration() helper converts milliseconds to ISO 8601 duration format (like PT14M30S). The GET /calendars/:id/upcoming endpoint calculates the time until the next event starts, converts it to ISO 8601 duration format, and includes it in the response as next_event_starts_in.
 
 Response with polling hint:
 
@@ -999,18 +483,7 @@ Response with polling hint:
 }
 ```
 
-`PT14M30S` means "14 minutes and 30 seconds" (ISO 8601 duration format). The agent schedules its next poll accordingly instead of using a fixed interval. Parseable by standard libraries:
-
-```javascript
-// JavaScript
-const duration = 'PT14M30S';
-// Use a library like 'iso8601-duration' or parse manually
-
-// Python
-import isodate
-duration = isodate.parse_duration('PT14M30S')
-# => timedelta(seconds=870)
-```
+`PT14M30S` means "14 minutes and 30 seconds" (ISO 8601 duration format). The agent schedules its next poll accordingly instead of using a fixed interval. Parseable by standard libraries in most languages.
 
 For low-frequency endpoints like `/changelog`, CalDave provides explicit frequency guidance:
 
@@ -1033,17 +506,7 @@ For low-frequency endpoints like `/changelog`, CalDave provides explicit frequen
 
 ### CalDave example
 
-CalDave supports six webhook types:
-
-**Mutation webhooks** (fired from route handlers):
-- `event.created` -- new event created
-- `event.updated` -- event modified
-- `event.deleted` -- event removed
-- `event.responded` -- attendee responded to invite
-
-**Time-based webhooks** (fired from background poller):
-- `event.starting` -- event starts in 5 minutes
-- `event.ending` -- event just ended
+CalDave supports six webhook types. Mutation webhooks (fired from route handlers) include event.created, event.updated, event.deleted, and event.responded. Time-based webhooks (fired from a background poller) include event.starting (5 minutes before) and event.ending (when event ends).
 
 Setting up webhooks on a calendar:
 
@@ -1059,64 +522,7 @@ curl -s -X POST https://caldave.ai/calendars \
   }'
 ```
 
-Webhook test endpoint:
-
-```javascript
-// src/routes/calendars.js (lines 237-294)
-router.post('/:id/webhook/test', auth, async (req, res) => {
-  const cal = await getOwnedCalendar(req, res);
-  if (!cal) return;
-
-  if (!cal.webhook_url) {
-    return res.status(400).json({ error: 'No webhook_url configured for this calendar' });
-  }
-
-  const testPayload = {
-    type: 'test',
-    calendar_id: cal.id,
-    message: 'This is a test webhook from CalDave',
-    timestamp: new Date().toISOString()
-  };
-
-  const body = JSON.stringify(testPayload);
-  const headers = { 'Content-Type': 'application/json', 'User-Agent': 'CalDave-Webhook/1.0' };
-
-  if (cal.webhook_secret) {
-    headers['X-CalDave-Signature'] = crypto
-      .createHmac('sha256', cal.webhook_secret)
-      .update(body)
-      .digest('hex');
-  }
-
-  try {
-    const resp = await fetch(cal.webhook_url, {
-      method: 'POST',
-      headers,
-      body,
-      signal: AbortSignal.timeout(10000)
-    });
-
-    if (!resp.ok) {
-      return res.status(502).json({
-        success: false,
-        status_code: resp.status,
-        message: `Webhook delivery failed with status ${resp.status}`
-      });
-    }
-
-    res.json({
-      success: true,
-      status_code: resp.status,
-      message: 'Webhook delivered successfully.'
-    });
-  } catch (err) {
-    res.status(502).json({
-      success: false,
-      message: `Webhook delivery failed: ${err.message}`
-    });
-  }
-});
-```
+Webhook test endpoint implementation in src/routes/calendars.js retrieves the calendar, verifies it has a webhook_url configured, constructs a test payload, adds HMAC signature if webhook_secret is configured, sends the request with a 10-second timeout, and returns success or failure with detailed status information.
 
 Webhook payload format:
 
@@ -1136,29 +542,7 @@ Webhook payload format:
 }
 ```
 
-HMAC-SHA256 signing:
-
-```javascript
-// src/lib/webhooks.js (lines 49-54)
-if (webhook_secret) {
-  headers['X-CalDave-Signature'] = crypto
-    .createHmac('sha256', webhook_secret)
-    .update(body)
-    .digest('hex');
-}
-```
-
-Verification (agent side):
-
-```javascript
-function verifyWebhook(body, signature, secret) {
-  const expected = crypto
-    .createHmac('sha256', secret)
-    .update(body)  // raw body string, not re-serialized JSON
-    .digest('hex');
-  return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
-}
-```
+HMAC-SHA256 signing is implemented in src/lib/webhooks.js. If webhook_secret is configured, the server computes a SHA-256 HMAC of the request body and includes it as the X-CalDave-Signature header. Agents should verify this signature by computing the HMAC of the raw body string (not re-serialized JSON) and comparing using timing-safe comparison.
 
 ---
 
@@ -1170,25 +554,7 @@ function verifyWebhook(body, signature, secret) {
 
 ### CalDave example
 
-CalDave accepts `rrule` as an alias for `recurrence`:
-
-```javascript
-// src/routes/events.js (lines 189-194)
-function normalizeBody(body) {
-  // Accept "rrule" as alias for "recurrence"
-  if (body.rrule !== undefined && body.recurrence === undefined) {
-    body.recurrence = body.rrule;
-  }
-  delete body.rrule;
-  return body;
-}
-
-// Both fields are in the known set so neither triggers unknown field rejection
-const KNOWN_EVENT_FIELDS = new Set([
-  'title', 'description', 'start', 'end', 'location', 'status',
-  'all_day', 'recurrence', 'rrule', 'attendees', 'metadata'
-]);
-```
+CalDave accepts `rrule` as an alias for `recurrence` in src/routes/events.js. The normalizeBody() function checks if rrule is present and recurrence is not, copies rrule to recurrence, deletes the rrule field, and returns the normalized body. Both fields are included in KNOWN_EVENT_FIELDS so neither triggers unknown field rejection during the validation step.
 
 Usage -- both fields work identically:
 
@@ -1218,23 +584,7 @@ Both requests work identically. The agent doesn't get an "unknown field" error w
 
 ### CalDave example
 
-CalDave events accept a `metadata` field:
-
-```javascript
-// src/routes/events.js (line 289)
-if (metadata !== undefined) {
-  if (typeof metadata !== 'object' || Array.isArray(metadata) || metadata === null) {
-    return res.status(400).json({ error: 'metadata must be an object' });
-  }
-  const metaSize = JSON.stringify(metadata).length;
-  if (metaSize > MAX_METADATA) {
-    return res.status(400).json({ error: `metadata exceeds ${MAX_METADATA / 1024}KB limit` });
-  }
-}
-
-// Size limit constant
-const MAX_METADATA = 16 * 1024;  // 16KB
-```
+CalDave events accept a `metadata` field validated in src/routes/events.js. The validation checks that metadata is an object (not an array, null, or primitive type), calculates the size of the serialized JSON, and enforces a 16KB size limit. Otherwise the field is stored as-is with no schema validation.
 
 Usage:
 
@@ -1286,60 +636,7 @@ CalDave validates that metadata is an object (not an array or primitive) and enf
 
 ### CalDave example
 
-CalDave provides `GET /calendars/:id/view` for plain text output:
-
-```javascript
-// src/routes/view.js (complete file)
-router.get('/:id/view', async (req, res) => {
-  // Verify calendar ownership
-  const { rows: cals } = await pool.query(
-    'SELECT id, name, timezone FROM calendars WHERE id = $1 AND agent_id = $2',
-    [req.params.id, req.agent.id]
-  );
-  if (cals.length === 0) {
-    res.type('text').status(404).send('Calendar not found.\n');
-    return;
-  }
-
-  const cal = cals[0];
-  const limit = Math.min(parseInt(req.query.limit) || 10, 50);
-
-  const { rows } = await pool.query(
-    `SELECT title, start_time, end_time, location, status, all_day FROM events
-     WHERE calendar_id = $1
-       AND start_time >= now()
-       AND status NOT IN ('cancelled', 'recurring')
-     ORDER BY start_time ASC
-     LIMIT $2`,
-    [req.params.id, limit]
-  );
-
-  // Format as fixed-width table
-  const header = pad('TITLE', 30) + pad('START', 22) + pad('END', 22) + pad('LOCATION', 20) + pad('STATUS', 10);
-  const sep = '-'.repeat(header.length);
-
-  let out = `${cal.name} (${cal.id})`;
-  if (cal.timezone) out += `  tz: ${cal.timezone}`;
-  out += '\n' + sep + '\n' + header + '\n' + sep + '\n';
-
-  if (rows.length === 0) {
-    out += 'No upcoming events.\n';
-  } else {
-    for (const r of rows) {
-      out += pad(r.title || '(untitled)', 30)
-        + pad(fmtDate(r.start_time), 22)
-        + pad(fmtDate(r.end_time), 22)
-        + pad(r.location || '—', 20)
-        + pad(r.status || 'confirmed', 10)
-        + '\n';
-    }
-  }
-
-  out += sep + '\n' + `${rows.length} event(s)\n`;
-
-  res.type('text').send(out);
-});
-```
+CalDave provides `GET /calendars/:id/view` for plain text output. The implementation in src/routes/view.js verifies calendar ownership, fetches upcoming events ordered by start time, formats them as a fixed-width table with columns for title, start, end, location, and status, and returns the result with Content-Type text/plain. The formatting includes the calendar name, timezone, a separator line, column headers, event rows with padding, and a summary line showing the event count.
 
 Usage:
 
@@ -1376,42 +673,7 @@ This is useful when an agent needs to include a calendar snapshot in a text-base
 
 CalDave abstracts away email and iCal complexity. Agents receive calendar invites via webhook without knowing anything about SMTP, MIME, or iCal parsing.
 
-**Inbound:** Multiple email providers send invites in different formats. CalDave normalizes them:
-
-```javascript
-// src/routes/inbound.js (lines 56-85)
-function normalizePayload(body) {
-  if (isAgentMail(body)) {
-    // AgentMail format
-    const msg = body.message;
-    return {
-      subject: msg.subject || '',
-      textBody: msg.text || '',
-      attachments: (msg.attachments || []).map((a) => ({
-        ct: a.content_type || '',
-        name: a.filename || '',
-        content: null, // must be fetched via API
-        agentmail: {
-          inboxId: msg.inbox_id,
-          messageId: msg.message_id,
-          attachmentId: a.attachment_id
-        }
-      }))
-    };
-  }
-
-  // Postmark format (default)
-  return {
-    subject: body.Subject || '',
-    textBody: body.TextBody || '',
-    attachments: (body.Attachments || []).map((a) => ({
-      ct: a.ContentType || '',
-      name: a.Name || '',
-      content: a.Content || null // base64
-    }))
-  };
-}
-```
+**Inbound:** Multiple email providers send invites in different formats. CalDave normalizes them in src/routes/inbound.js with a normalizePayload() function that detects the provider format (AgentMail or Postmark), extracts subject, text body, and attachments, and returns a consistent structure. The agent sees a clean webhook payload, never the raw SMTP/MIME format.
 
 The agent sees a clean webhook payload, never the raw SMTP/MIME format:
 
@@ -1589,18 +851,7 @@ curl -s -X POST https://caldave.ai/agents \
 # => { "agent_id": "agt_abc123", "api_key": "sk_live_...", "owned_by": "hum_xyz" }
 ```
 
-Implementation:
-
-```javascript
-// src/routes/agents.js (lines 76-82)
-if (req.human) {
-  await pool.query(
-    'INSERT INTO human_agents (id, human_id, agent_id) VALUES ($1, $2, $3)',
-    [humanAgentId(), req.human.id, id]
-  );
-  response.owned_by = req.human.id;
-}
-```
+The implementation in src/routes/agents.js checks for req.human after creating the agent, and if present, inserts a record in the human_agents junction table and includes owned_by in the response.
 
 This inverts the traditional model: the agent is the primary entity, human oversight is optional and additive.
 
@@ -1614,42 +865,7 @@ This inverts the traditional model: the agent is the primary entity, human overs
 
 ### CalDave example
 
-CalDave uses express-rate-limit with RFC draft-7 standard headers:
-
-```javascript
-// src/middleware/rateLimit.js
-const apiLimiter = rateLimit({
-  windowMs: 60 * 1000,              // 1 minute
-  limit: 1000,                      // 1000 requests
-  standardHeaders: 'draft-7',       // RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset
-  legacyHeaders: false,             // No X-RateLimit-* headers
-  message: { error: 'Too many requests, please try again later' }
-});
-
-const agentCreationLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000,         // 1 hour
-  limit: 20,                        // 20 requests
-  standardHeaders: 'draft-7',
-  legacyHeaders: false,
-  message: { error: 'Too many agent creation requests, please try again later' }
-});
-
-const inboundLimiter = rateLimit({
-  windowMs: 60 * 1000,              // 1 minute
-  limit: 60,                        // 60 requests
-  standardHeaders: 'draft-7',
-  legacyHeaders: false,
-  message: { error: 'Too many requests' }
-});
-
-const humanAuthLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,         // 15 minutes
-  limit: 10,                        // 10 requests
-  standardHeaders: 'draft-7',
-  legacyHeaders: false,
-  message: { error: 'Too many login/signup attempts, please try again later' }
-});
-```
+CalDave uses express-rate-limit with RFC draft-7 standard headers configured in src/middleware/rateLimit.js. Different limiters are defined for general API calls (1000/minute), agent creation (20/hour), inbound webhooks (60/minute), and human authentication (10/15 minutes). Each limiter uses standardHeaders: 'draft-7' to include RateLimit-Limit, RateLimit-Remaining, and RateLimit-Reset headers, and disables legacy X-RateLimit-* headers.
 
 Every response includes standard headers:
 
@@ -1669,21 +885,7 @@ Headers:
 - `RateLimit-Remaining` -- requests remaining in current window (997)
 - `RateLimit-Reset` -- seconds until window resets (45)
 
-An agent can read these on every response and implement intelligent backoff:
-
-```javascript
-const response = await fetch('https://caldave.ai/calendars', {
-  headers: { 'Authorization': `Bearer ${apiKey}` }
-});
-
-const remaining = parseInt(response.headers.get('ratelimit-remaining'));
-const reset = parseInt(response.headers.get('ratelimit-reset'));
-
-if (remaining < 10) {
-  console.log(`Rate limit almost exceeded. ${remaining} requests remaining. Resets in ${reset}s.`);
-  // Back off or queue requests
-}
-```
+An agent can read these on every response and implement intelligent backoff by checking the remaining count and reset time.
 
 CalDave applies different rate limits to different operation types:
 
@@ -1704,57 +906,9 @@ CalDave applies different rate limits to different operation types:
 
 ### CalDave example
 
-CalDave provides a remote MCP endpoint at `POST /mcp`:
+CalDave provides a remote MCP endpoint at `POST /mcp` implemented in src/routes/mcp.mjs. The MCP server provides 24 tools covering all CalDave operations (agent management, calendars, events, feeds, SMTP), a guide resource at caldave://guide with getting-started content, and structured instructions with workflow descriptions and tool selection guidance.
 
-```javascript
-// src/routes/mcp.mjs (lines 1-12)
-/**
- * Remote MCP endpoint — Streamable HTTP transport
- *
- * Exposes CalDave's MCP tools at POST/GET/DELETE /mcp.
- * Agents connect with their API key as a Bearer token.
- *
- * Install in any MCP client:
- *   {
- *     "url": "https://caldave.ai/mcp",
- *     "headers": { "Authorization": "Bearer sk_live_..." }
- *   }
- */
-```
-
-The MCP server provides:
-- **24 tools** covering all CalDave operations (agent management, calendars, events, feeds, SMTP)
-- **Guide resource** at `caldave://guide` with getting-started content
-- **Structured instructions** with workflow descriptions and tool selection guidance
-
-Tool implementation:
-
-```javascript
-// src/lib/mcp-tools.mjs
-export function registerTools(server, callApi) {
-  server.addTool({
-    name: 'caldave_create_calendar',
-    description: 'Create a new calendar. Requires a name and timezone.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        name: { type: 'string', description: 'Calendar name' },
-        timezone: { type: 'string', description: 'IANA timezone (e.g., America/New_York)' },
-        webhook_url: { type: 'string', description: 'Optional webhook URL for event notifications' },
-        webhook_secret: { type: 'string', description: 'Optional HMAC secret for webhook signing' }
-      },
-      required: ['name', 'timezone']
-    }
-  }, async (args) => {
-    const data = await callApi('POST', '/calendars', args);
-    return {
-      content: [{ type: 'text', text: JSON.stringify(data, null, 2) }]
-    };
-  });
-
-  // ... 23 more tools
-}
-```
+Tools are registered in src/lib/mcp-tools.mjs with name, description, and JSON Schema for input validation. Each tool calls the underlying HTTP API and returns formatted results.
 
 Agent configuration in Claude Desktop or other MCP clients:
 
@@ -1771,28 +925,7 @@ Agent configuration in Claude Desktop or other MCP clients:
 }
 ```
 
-Once configured, the agent can use natural language tool calls:
-
-```
-Agent: I need to create a calendar called "Team Events" in Pacific time.
-
-[Tool call: caldave_create_calendar]
-{
-  "name": "Team Events",
-  "timezone": "America/Los_Angeles"
-}
-
-[Tool response]
-{
-  "calendar_id": "cal_abc123",
-  "name": "Team Events",
-  "timezone": "America/Los_Angeles",
-  "email": "cal-abc123@invite.caldave.ai",
-  "ical_feed_url": "https://caldave.ai/feeds/cal_abc123.ics?token=feed_...",
-  "inbound_webhook_url": "https://caldave.ai/inbound/inb_...",
-  "message": "This calendar can receive invites at cal-abc123@invite.caldave.ai..."
-}
-```
+Once configured, the agent can use natural language tool calls. For example, an agent can say "I need to create a calendar called Team Events in Pacific time" and the MCP client will translate that to a caldave_create_calendar tool call with appropriate parameters. The tool response includes the full calendar object with calendar_id, email address, feed URL, and other details.
 
 MCP is additive. The HTTP API remains the primary interface. MCP provides an alternative integration path for agents that support it, with the same capabilities but a more natural tool-based interface for LLMs.
 
@@ -1806,33 +939,7 @@ MCP is additive. The HTTP API remains the primary interface. MCP provides an alt
 
 ### CalDave example
 
-When an agent creates a calendar, CalDave automatically creates a welcome event:
-
-```javascript
-// src/routes/calendars.js (lines 106-128)
-const skipWelcome = welcome_event === false;
-if (!skipWelcome) {
-  const evtId = eventId();
-  const tomorrow = new Date();
-  tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
-  const dateStr = tomorrow.toISOString().slice(0, 10); // YYYY-MM-DD
-
-  // Use Postgres AT TIME ZONE to convert 9am in the calendar's timezone to UTC
-  await pool.query(
-    `INSERT INTO events (id, calendar_id, title, description, start_time, end_time)
-     VALUES ($1, $2, $3, $4,
-       ($5::date + TIME '09:00') AT TIME ZONE $6,
-       ($5::date + TIME '09:30') AT TIME ZONE $6)`,
-    [
-      evtId, id,
-      'Send Peter (founder of CalDave) feedback',
-      'Email Peter Clark, the founder of CalDave, with feedback on CalDave. Is this product working as expected? Is there anything he should add? What is your purpose as an agent? His email is: peterclark@me.com',
-      dateStr,
-      tz
-    ]
-  );
-}
-```
+When an agent creates a calendar, CalDave automatically creates a welcome event unless welcome_event is explicitly set to false. The implementation in src/routes/calendars.js creates an event scheduled for 9am tomorrow in the calendar's timezone using Postgres AT TIME ZONE conversion. The event asks the agent to send feedback to the founder with details about their use case.
 
 Default behavior -- welcome event created:
 
@@ -1876,26 +983,7 @@ Agents building integrations can leave the default behavior. Production deployme
 
 ### CalDave example
 
-Calendar creation returns all derived URLs pre-computed:
-
-```javascript
-// src/routes/calendars.js (lines 134-143)
-const inboundUrl = `https://${DOMAIN}/inbound/${inbToken}`;
-const message = skipWelcome
-  ? `This calendar can receive invites at ${email}. Forward emails to ${inboundUrl}. Save this information.`
-  : `This calendar can receive invites at ${email}. Forward emails to ${inboundUrl}. Save this information. To welcome you to CalDave we auto-added an event to your calendar asking for feedback — hope that is okay!`;
-
-res.status(201).json({
-  calendar_id: id,
-  name,
-  timezone: tz,
-  email,
-  ical_feed_url: `https://${DOMAIN}/feeds/${id}.ics?token=${token}`,
-  feed_token: token,
-  inbound_webhook_url: inboundUrl,
-  message
-});
-```
+Calendar creation returns all derived URLs pre-computed in src/routes/calendars.js. The response includes the calendar email address (constructed from calendar ID), the iCal feed URL (with feed token as query parameter), the feed token separately, and the inbound webhook URL for email forwarding. All URLs are fully qualified and ready to use without any string manipulation.
 
 Response:
 
@@ -1936,79 +1024,9 @@ This pattern appears throughout CalDave:
 
 ### CalDave example
 
-CalDave's `fireWebhook()` function never blocks:
+CalDave's `fireWebhook()` function in src/lib/webhooks.js is wrapped in an async IIFE that runs independently of the response. The entire function is fire-and-forget: it queries for webhook configuration, constructs the payload, adds HMAC signature if configured, sends the request with a 10-second timeout, logs success or failure, and catches all errors to prevent crashes. The catch handler logs errors but never throws, ensuring webhook failures can't impact the application.
 
-```javascript
-// src/lib/webhooks.js (complete file)
-function fireWebhook(calendarId, type, eventData) {
-  // Entire function is fire-and-forget — wrap in async IIFE, swallow errors
-  (async () => {
-    const { rows } = await pool.query(
-      'SELECT webhook_url, webhook_secret FROM calendars WHERE id = $1',
-      [calendarId]
-    );
-
-    if (rows.length === 0 || !rows[0].webhook_url) return;
-
-    const { webhook_url, webhook_secret } = rows[0];
-
-    const payload = {
-      type,
-      calendar_id: calendarId,
-      event_id: eventData.id || null,
-      event: eventData,
-      timestamp: new Date().toISOString()
-    };
-
-    const body = JSON.stringify(payload);
-    const headers = {
-      'Content-Type': 'application/json',
-      'User-Agent': 'CalDave-Webhook/1.0'
-    };
-
-    if (webhook_secret) {
-      headers['X-CalDave-Signature'] = crypto
-        .createHmac('sha256', webhook_secret)
-        .update(body)
-        .digest('hex');
-    }
-
-    const res = await fetch(webhook_url, {
-      method: 'POST',
-      headers,
-      body,
-      signal: AbortSignal.timeout(10000)  // 10-second timeout
-    });
-
-    if (!res.ok) {
-      console.error('[webhook] Delivery failed: type=%s calendar=%s event=%s status=%d',
-        type, calendarId, eventData.id || 'n/a', res.status);
-    } else {
-      console.log('[webhook] Delivered: type=%s calendar=%s event=%s status=%d',
-        type, calendarId, eventData.id || 'n/a', res.status);
-    }
-  })().catch(err => {
-    console.error('[webhook] Delivery error: type=%s calendar=%s event=%s error=%s',
-      type, calendarId, eventData.id || 'n/a', err.message);
-  });
-}
-```
-
-Used in route handlers -- response is sent FIRST, webhook fires after:
-
-```javascript
-// src/routes/events.js
-router.post('/:id/events', auth, async (req, res) => {
-  // ... create event
-  const response = formatEvent(event);
-
-  // Send response immediately
-  res.status(201).json(response);
-
-  // Fire webhook asynchronously (never blocks the response)
-  fireWebhook(req.params.id, 'event.created', response);
-});
-```
+Used in route handlers -- response is sent FIRST, webhook fires after. For example, in src/routes/events.js, the POST handler creates the event, formats the response, sends it to the client with res.status(201).json(), and then calls fireWebhook() asynchronously.
 
 Key details:
 - Async IIFE `(async () => { ... })()` runs independently
